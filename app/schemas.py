@@ -178,6 +178,50 @@ class AuthorizationMigrationOut(BaseModel):
     )
 
 
+# ----------------------------------------------------------- 授权间转拨
+class QuotaTransferRequest(BaseModel):
+    """授权间转拨未占用发行次数。
+
+    在同一素材、地区、渠道的两条不同授权间，把源授权尚未占用的发行次数
+    转拨给目标授权（仅调整两端 ``max_count``，既有申请与预留归属不变）。
+    ``operation_no`` 为幂等键：相同操作号 + 相同参数重复请求返回首次
+    转拨结果；相同操作号 + 不同参数返回 409。
+    """
+
+    operation_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="操作号（幂等键）：相同操作号+相同参数重放返回首次结果",
+    )
+    source_authorization_id: int = Field(
+        gt=0, description="源授权编号（转出方）"
+    )
+    target_authorization_id: int = Field(
+        gt=0, description="目标授权编号（转入方，须与源授权不同）"
+    )
+    count: int = Field(gt=0, description="转拨次数（正整数）")
+
+    @field_validator("operation_no")
+    @classmethod
+    def _strip_operation_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空串")
+        return v
+
+
+class QuotaTransferOut(BaseModel):
+    operation_no: str = Field(description="操作号（与请求一致）")
+    count: int = Field(description="实际转拨次数")
+    source_authorization: AuthorizationOut = Field(
+        description="源授权转拨后的额度与占用快照"
+    )
+    target_authorization: AuthorizationOut = Field(
+        description="目标授权转拨后的额度与占用快照"
+    )
+    created_at: datetime = Field(description="首次转拨受理时刻（带时区）")
+
+
 class DistributionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

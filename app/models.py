@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     DateTime,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -374,6 +375,47 @@ class WaitlistItem(Base):
 
     waitlist: Mapped["Waitlist"] = relationship(back_populates="items")
     material: Mapped["Material"] = relationship()
+
+
+class QuotaTransfer(Base):
+    """授权间未占用发行次数转拨记录（按操作号幂等）。
+
+    运营在同一素材、地区、渠道的两条不同授权间转拨**未占用**的发行次数
+    （仅调整两端 ``max_count``，既有申请与预留的归属不变）。每条成功转拨
+    落库一条记录：
+
+    - ``operation_no`` 全局唯一，是幂等键：相同操作号 + 相同参数的重复
+      请求返回首次转拨结果（``result`` 快照原样回放，不依赖授权与通道的
+      当前状态，故重放不受随后冻结/停用影响）；相同操作号 + 不同参数
+      → 409 冲突；
+    - ``result`` 存首次转拨后两端的额度与占用快照（响应体中的两个授权
+      对象），重放时原样返回，保证「重复请求返回首次转拨结果」。
+    """
+
+    __tablename__ = "quota_transfers"
+    __table_args__ = (
+        Index("ux_quota_transfer_operation", "operation_no", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 操作号（幂等键，全局唯一）。
+    operation_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    # 转拨次数（正整数）：源授权 max_count -count、目标授权 +count。
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 冗余记录通道维度（两端一致，转拨的前提），便于排查与对账。
+    region: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 首次转拨结果快照：{"source_authorization": {...}, "target_authorization": {...}}
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
 
 
 class ChannelFreeze(Base):

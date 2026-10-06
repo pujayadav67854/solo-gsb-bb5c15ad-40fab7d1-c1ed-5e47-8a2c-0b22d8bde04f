@@ -114,6 +114,33 @@ class MigrationRejected(APIError):
         )
 
 
+# ------------------------------------------------------------- 授权间转拨
+class TransferRejected(APIError):
+    """授权间转拨核验未通过：整笔拒绝，两端授权额度均不变。"""
+
+    def __init__(self, reasons: list[dict]):
+        super().__init__(
+            status_code=422,
+            code="transfer_rejected",
+            message="授权转拨核验未通过，两端授权额度均未变更",
+            details=reasons,
+        )
+
+
+class TransferOperationConflict(APIError):
+    """操作号已被一笔参数不同的转拨请求占用（幂等键冲突）。"""
+
+    def __init__(self, operation_no: str):
+        super().__init__(
+            status_code=409,
+            code="transfer_operation_conflict",
+            message=(
+                f"操作号已被其他转拨请求使用且参数不一致：{operation_no}"
+            ),
+            details=[{"operation_no": operation_no}],
+        )
+
+
 class ReservationRejected(APIError):
     """预留核验未通过：整体拒绝、不占用任何（预留）额度。"""
 

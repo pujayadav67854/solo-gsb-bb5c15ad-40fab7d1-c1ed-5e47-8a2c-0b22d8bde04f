@@ -1,4 +1,4 @@
-"""核心业务逻辑：登记 / 核验占用 / 查询 / 撤销 / 改期 / 授权退役改挂 / 额度预留 / 候补 / 通道冻结。
+"""核心业务逻辑：登记 / 核验占用 / 查询 / 撤销 / 改期 / 授权退役改挂 / 额度预留 / 候补 / 通道冻结 / 授权间转拨。
 
 并发安全
 ========
@@ -6,13 +6,14 @@
 
     **通道咨询锁（region+channel）→ 冻结状态闸门 → 到期预留结算 →
     候补队列处理（冻结通道仅失效不成交）→
-    冻结/恢复/预留/申请/候补行 → 授权行（id 升序）→ 明细行**
+    冻结/恢复/预留/申请/候补行 → 授权行（id 升序）→ 明细行 →
+    转拨记录（operation_no 唯一约束）**
 
 通道咨询锁按 ``region+channel`` 分桶：同一通道内的提交、预留、确认、
-取消、撤销、改期、改挂、候补受理与候补成交，以及冻结/恢复全部串行
-判定。授权行只可能被同通道事务竞争（授权匹配维度即 region+channel，
-改挂也要求两端通道一致），因此不同通道的事务不会争用同一授权行，跨桶
-不可能形成等待环；同事务内对同一批授权一律按 id 升序
+取消、撤销、改期、改挂、转拨、候补受理与候补成交，以及冻结/恢复全部
+串行判定。授权行只可能被同通道事务竞争（授权匹配维度即 region+channel，
+改挂与转拨也要求两端通道一致），因此不同通道的事务不会争用同一授权行，
+跨桶不可能形成等待环；同事务内对同一批授权一律按 id 升序
 ``SELECT ... FOR UPDATE``。
 
 通道冻结（region+channel）
@@ -88,6 +89,8 @@ from app.errors import (
     ReservationExpired,
     ReservationRejected,
     ResourceNotFound,
+    TransferOperationConflict,
+    TransferRejected,
     UnknownMaterial,
     WaitlistAlreadyCancelled,
     WaitlistAlreadyExpired,
@@ -99,10 +102,12 @@ from app.errors import (
 from app.schemas import (
     AuthorizationCreate,
     AuthorizationMigrationRequest,
+    AuthorizationOut,
     ChannelFreezeRequest,
     DistributionCreate,
     DistributionReschedule,
     MaterialCreate,
+    QuotaTransferRequest,
     ReservationCreate,
     WaitlistCreate,
 )
@@ -1809,6 +1814,255 @@ def migrate_authorization(
         "migrated_count": n,
         "source_authorization": source,
         "replacement_authorization": target,
+    }
+
+
+# ============================================================ 授权间转拨
+def _find_transfer(
+    db: Session, operation_no: str
+) -> models.QuotaTransfer | None:
+    """按操作号查询已落库的转拨记录（幂等键）。"""
+    return db.scalar(
+        select(models.QuotaTransfer).where(
+            models.QuotaTransfer.operation_no == operation_no
+        )
+    )
+
+
+def _transfer_result(
+    existing: models.QuotaTransfer, data: QuotaTransferRequest
+) -> dict:
+    """重放已落库的转拨：参数一致返回首次结果快照，不一致报 409 冲突。
+
+    重放只读取转拨记录本身，不依赖授权与通道的当前状态——
+    因此不受首次转拨之后的冻结/停用影响。
+    """
+    if (
+        existing.source_authorization_id != data.source_authorization_id
+        or existing.target_authorization_id != data.target_authorization_id
+        or existing.count != data.count
+    ):
+        raise TransferOperationConflict(data.operation_no)
+    return {
+        "operation_no": existing.operation_no,
+        "count": existing.count,
+        "source_authorization": existing.result["source_authorization"],
+        "target_authorization": existing.result["target_authorization"],
+        "created_at": existing.created_at,
+    }
+
+
+def transfer_quota(db: Session, data: QuotaTransferRequest) -> dict:
+    """在同一素材、地区、渠道的两条不同授权间转拨未占用的发行次数。
+
+    受理条件（任一不满足则整笔拒绝，两端额度均不变）：
+
+    - 两端授权均存在（不存在 → 404），编号不同，且素材/地区/渠道一致
+      （授权时段可以不同）；
+    - 通道未冻结（``channel_frozen``）且两端授权均处于启用状态；
+    - 可转出量充足：``count <= 源 max_count - used_count - reserved_count``
+      （先在通道锁内结算到期预留并按原顺序处理候补，再取最新余量判定）；
+    - 转出后源授权额度仍为正：``源 max_count - count >= 1``。
+
+    成功后原子更新两端 ``max_count``（源 -count、目标 +count；既有申请与
+    预留的归属不变），落库转拨记录（含两端转拨后快照），并在同一事务内
+    重算本通道候补——目标授权新增的余量优先供仍有效的队首成交，过期或
+    授权失配者依现有规则出队。
+
+    幂等：``operation_no`` 全局唯一。相同操作号 + 相同参数的重复请求
+    返回首次转拨结果（快照原样回放，不受随后冻结/停用影响）；相同操作号
+    + 不同参数返回 409 ``transfer_operation_conflict``。并发下同号请求
+    由唯一约束兜底，恰转拨一次；不同号请求在通道咨询锁内串行，绝不超额。
+    """
+    # 1) 幂等重放：相同操作号已落库 → 参数一致返回首次结果，不一致 409。
+    #    纯读转拨记录，不触碰授权/通道状态，故不受随后冻结/停用影响。
+    existing = _find_transfer(db, data.operation_no)
+    if existing is not None:
+        return _transfer_result(existing, data)
+
+    source_id = data.source_authorization_id
+    target_id = data.target_authorization_id
+
+    def _reject(reason: str, message: str) -> TransferRejected:
+        return TransferRejected(
+            [
+                {
+                    "reason": reason,
+                    "message": message,
+                    "source_authorization_id": source_id,
+                    "target_authorization_id": target_id,
+                }
+            ]
+        )
+
+    if source_id == target_id:
+        raise _reject(
+            "same_authorization", "源授权与目标授权必须为不同编号"
+        )
+
+    # 不加锁读取，仅用于存在性/维度判断与确定咨询锁桶；
+    # 维度（material_id/region/channel）不可变，无需锁保护。
+    source = db.get(models.Authorization, source_id)
+    if source is None:
+        raise ResourceNotFound("授权", source_id)
+    target = db.get(models.Authorization, target_id)
+    if target is None:
+        raise ResourceNotFound("授权", target_id)
+    if (
+        source.material_id != target.material_id
+        or source.region != target.region
+        or source.channel != target.channel
+    ):
+        raise _reject(
+            "dimension_mismatch",
+            "源授权与目标授权的素材、地区或渠道不一致，不可转拨",
+        )
+
+    region, channel = source.region, source.channel
+    try:
+        # 2) 第一加锁点：通道咨询锁（与提交/预留/确认/取消/撤销/改期/
+        #    改挂/候补/冻结恢复同一把锁，同通道严格串行）。
+        _channel_lock(db, region, channel)
+        now = utcnow()
+        frozen_row = _channel_is_frozen(db, region, channel)
+
+        # 锁内复查操作号：并发同号请求在通道锁后串行，先到者已提交可见，
+        # 直接按首次结果重放/判冲突，避免重复转拨。
+        existing = _find_transfer(db, data.operation_no)
+        if existing is not None:
+            db.rollback()
+            return _transfer_result(existing, data)
+
+        # 3) 先在通道锁内结算本通道到期预留（归还 reserved_count），并按
+        #    原受理顺序处理候补（冻结通道仅做有效期失效结算、不成交），
+        #    再以源授权的最新余量判定可转出量。
+        _settle_expired(
+            db,
+            now,
+            region=region,
+            channel=channel,
+            extra_auth_ids=[source_id, target_id],
+            frozen=frozen_row is not None,
+        )
+        _process_waitlist(
+            db, region, channel, now, allow_fulfill=frozen_row is None
+        )
+        locked = _lock_authorizations(db, [source_id, target_id])
+        by_id = {a.id: a for a in locked}
+        source_l = by_id[source_id]
+        target_l = by_id[target_id]
+
+        # 4) 冻结闸门：通道冻结期间不受理转拨（整笔拒绝，不改额度）。
+        if frozen_row is not None:
+            raise ChannelFrozen(region, channel, frozen_row.reason)
+
+        # 5) 两端均须启用（停用仅影响新申请/新预留/转拨，不影响既有归属）。
+        if source_l.status != "active" or target_l.status != "active":
+            raise _reject(
+                "authorization_inactive",
+                "源授权与目标授权须均处于启用状态才可转拨"
+                f"（源 id={source_id}：{source_l.status}，"
+                f"目标 id={target_id}：{target_l.status}）",
+            )
+
+        # 6) 可转出量 = 源 max_count - used_count - reserved_count。
+        available = (
+            source_l.max_count - source_l.used_count - source_l.reserved_count
+        )
+        if data.count > available:
+            raise _reject(
+                "insufficient_quota",
+                f"源授权（id={source_id}）可转出量不足：请求转拨 "
+                f"{data.count} 次，未占用余量仅 {available} 次"
+                f"（max={source_l.max_count}、正式占用 "
+                f"{source_l.used_count}、未到期预留 "
+                f"{source_l.reserved_count}）",
+            )
+        # 转出后源授权额度必须仍为正整数。
+        if source_l.max_count - data.count <= 0:
+            raise _reject(
+                "source_quota_nonpositive",
+                f"转出后源授权（id={source_id}）额度须保持为正："
+                f"max_count {source_l.max_count} - {data.count} <= 0",
+            )
+
+        # 7) 原子更新两端 max_count（条件更新护栏，断言影响行数）：
+        #    源 -count（不得击穿占用与预留、不得非正），目标 +count。
+        dec = db.execute(
+            update(models.Authorization)
+            .where(
+                models.Authorization.id == source_id,
+                models.Authorization.max_count
+                >= models.Authorization.used_count
+                + models.Authorization.reserved_count
+                + data.count,
+                models.Authorization.max_count > data.count,
+            )
+            .values(max_count=models.Authorization.max_count - data.count)
+        )
+        if dec.rowcount != 1:
+            db.rollback()
+            raise RuntimeError(
+                f"转拨迁出失败：授权 {source_id} 余量/正额度护栏未通过"
+            )
+        inc = db.execute(
+            update(models.Authorization)
+            .where(models.Authorization.id == target_id)
+            .values(max_count=models.Authorization.max_count + data.count)
+        )
+        if inc.rowcount != 1:
+            db.rollback()
+            raise RuntimeError(f"转拨迁入失败：授权 {target_id} 更新异常")
+
+        # 8) 重读两端最新行，落库转拨记录（含两端转拨后额度与占用快照，
+        #    供重放原样返回）。
+        locked = _lock_authorizations(db, [source_id, target_id])
+        by_id = {a.id: a for a in locked}
+        payload = {
+            "source_authorization": AuthorizationOut.model_validate(
+                by_id[source_id]
+            ).model_dump(mode="json"),
+            "target_authorization": AuthorizationOut.model_validate(
+                by_id[target_id]
+            ).model_dump(mode="json"),
+        }
+        transfer = models.QuotaTransfer(
+            operation_no=data.operation_no,
+            source_authorization_id=source_id,
+            target_authorization_id=target_id,
+            count=data.count,
+            region=region,
+            channel=channel,
+            result=payload,
+        )
+        db.add(transfer)
+        db.flush()
+
+        # 9) 同一事务内重算本通道候补：目标授权新增余量优先供仍有效的
+        #    队首成交，过期或授权失配者依现有规则出队。
+        _process_waitlist(db, region, channel, now)
+        db.commit()
+    except (ChannelFrozen, TransferRejected):
+        db.rollback()
+        raise
+    except IntegrityError:
+        # 并发同号（含跨通道异参）：唯一约束兜底，恰一笔落库；
+        # 回滚后按已提交记录重放/判冲突。
+        db.rollback()
+        existing = _find_transfer(db, data.operation_no)
+        if existing is None:
+            raise
+        return _transfer_result(existing, data)
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "operation_no": transfer.operation_no,
+        "count": transfer.count,
+        "source_authorization": payload["source_authorization"],
+        "target_authorization": payload["target_authorization"],
+        "created_at": transfer.created_at,
     }
 
 
