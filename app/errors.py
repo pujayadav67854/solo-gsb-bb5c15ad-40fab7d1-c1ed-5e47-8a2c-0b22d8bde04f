@@ -298,3 +298,30 @@ class ChannelFrozen(APIError):
                 }
             ],
         )
+
+
+# ------------------------------------------------------------- 授权额度转拨
+class TransferRejected(APIError):
+    """额度转拨核验未通过：整笔拒绝，两端授权额度均不变。"""
+
+    def __init__(self, reasons: list[dict]):
+        super().__init__(
+            status_code=422,
+            code="quota_transfer_rejected",
+            message="额度转拨核验未通过，两端授权额度均未变更",
+            details=reasons,
+        )
+
+
+class TransferOperationConflict(APIError):
+    """相同操作号携带不同参数：与首次转拨请求冲突（幂等键冲突）。"""
+
+    def __init__(self, operation_no: str):
+        super().__init__(
+            status_code=409,
+            code="quota_transfer_conflict",
+            message=(
+                f"操作号 {operation_no!r} 已用于一笔不同参数的转拨；"
+                "相同操作号必须以相同参数重放"
+            ),
+        )

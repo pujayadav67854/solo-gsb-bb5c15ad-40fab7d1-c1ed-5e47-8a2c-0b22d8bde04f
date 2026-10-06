@@ -410,3 +410,60 @@ class ChannelFreezeOut(BaseModel):
     )
     frozen_at: datetime | None = None
     resumed_at: datetime | None = None
+
+
+# ----------------------------------------------------------- 授权额度转拨
+class QuotaTransferCreate(BaseModel):
+    """授权间额度转拨：同一素材/地区/渠道下，源授权 → 目标授权。
+
+    ``operation_no`` 为幂等键：相同操作号 + 相同参数的重复请求返回首次
+    转拨结果；相同操作号 + 不同参数返回 409 ``quota_transfer_conflict``。
+    """
+
+    source_authorization_id: int = Field(
+        gt=0, description="源授权编号（转出方）"
+    )
+    target_authorization_id: int = Field(
+        gt=0, description="目标授权编号（转入方）"
+    )
+    count: int = Field(gt=0, description="转拨次数（正整数）")
+    operation_no: str = Field(
+        min_length=1,
+        max_length=64,
+        description="操作号（幂等键，全局唯一）",
+    )
+
+    @field_validator("operation_no")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空串")
+        return v
+
+
+class QuotaTransferAuthSnapshot(BaseModel):
+    """转拨后一端授权的额度与占用快照。"""
+
+    authorization_id: int
+    max_count: int
+    used_count: int
+    reserved_count: int
+    remaining: int = Field(
+        description="正式可占用余量：max_count - used_count"
+    )
+    reservable_remaining: int = Field(
+        description="可预留余量：max_count - used_count - reserved_count"
+    )
+
+
+class QuotaTransferOut(BaseModel):
+    operation_no: str
+    count: int
+    source_authorization: QuotaTransferAuthSnapshot = Field(
+        description="源授权（转出方）转拨后的额度与占用快照"
+    )
+    target_authorization: QuotaTransferAuthSnapshot = Field(
+        description="目标授权（转入方）转拨后的额度与占用快照"
+    )
+    created_at: datetime = Field(description="首次转拨完成时刻（带时区）")

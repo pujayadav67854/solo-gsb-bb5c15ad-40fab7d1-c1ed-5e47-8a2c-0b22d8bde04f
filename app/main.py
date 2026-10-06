@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
@@ -28,8 +28,10 @@ app = FastAPI(
         "支持 1～30 分钟有效期的发行额度预留（待确认/确认/取消/过期）；"
         "支持额度不足时的通道候补队列（按受理顺序成交/失败/取消，"
         "候补可设 1～1440 分钟申请有效期，到期处理队首时标记 expired 并释放位置）；"
-        "并支持按地区+渠道临时冻结/恢复新额度发放（冻结期间拒绝新的直接"
-        "发行、额度预留与候补受理；恢复时先按原受理顺序处理仍有效候补）。"
+        "支持按地区+渠道临时冻结/恢复新额度发放（冻结期间拒绝新的直接"
+        "发行、额度预留与候补受理；恢复时先按原受理顺序处理仍有效候补）；"
+        "并支持同一素材/地区/渠道下两条授权间的未占用次数转拨"
+        "（操作号幂等，转拨后同事务重算候补）。"
     ),
     lifespan=lifespan,
 )
@@ -124,6 +126,21 @@ def migrate_authorization(
     db: Session = Depends(get_db),
 ):
     return services.migrate_authorization(db, body)
+
+
+@app.post(
+    "/api/v1/authorizations/transfer",
+    response_model=schemas.QuotaTransferOut,
+    tags=["authorizations"],
+    summary=(
+        "授权间额度转拨：同一素材/地区/渠道下把源授权未占用次数转拨到"
+        "目标授权（操作号幂等，转拨后同事务重算候补）"
+    ),
+)
+def transfer_authorization_quota(
+    body: schemas.QuotaTransferCreate, db: Session = Depends(get_db)
+):
+    return services.transfer_quota(db, body)
 
 
 # ------------------------------------------------------------------ 发行

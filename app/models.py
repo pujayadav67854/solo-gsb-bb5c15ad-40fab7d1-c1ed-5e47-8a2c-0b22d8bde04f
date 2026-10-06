@@ -431,3 +431,55 @@ class ChannelFreeze(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+
+
+class QuotaTransfer(Base):
+    """一次授权间额度转拨：同一素材/地区/渠道下，把源授权未占用的
+    可发行次数（``max_count`` 的一部分）转拨到目标授权。
+
+    - 仅两端授权均启用且通道未冻结时受理；两端授权时段可以不同；
+    - 既有申请与预留的归属不变，仅原子调整两端 ``max_count``；
+    - ``operation_no`` 全局唯一（幂等键）：相同操作号 + 相同参数的
+      重复请求返回首次转拨结果（重放不受随后的通道冻结/授权停用影响）；
+      相同操作号 + 不同参数为冲突（409）；
+    - 快照列记录首次转拨完成（含同事务候补重算）后两端的额度与占用，
+      重放时原样返回，不随后续业务变化。
+    """
+
+    __tablename__ = "quota_transfers"
+    __table_args__ = (
+        CheckConstraint("count > 0", name="ck_transfer_count_positive"),
+        Index("ux_quota_transfer_operation", "operation_no", unique=True),
+        Index(
+            "ix_transfer_auths",
+            "source_authorization_id",
+            "target_authorization_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 幂等键：运营侧操作号，全局唯一。
+    operation_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    region: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 首次转拨完成后的两端额度与占用快照（重放原样返回）。
+    source_max_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_used_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_reserved_count: Mapped[int] = mapped_column(
+        Integer, nullable=False
+    )
+    target_max_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_used_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_reserved_count: Mapped[int] = mapped_column(
+        Integer, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )

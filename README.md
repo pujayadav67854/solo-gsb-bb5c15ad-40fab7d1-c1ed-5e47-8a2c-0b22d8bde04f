@@ -1,9 +1,9 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度）；并支持发行团队**按地区 + 渠道临时冻结 / 恢复新额度发放**（冻结须填原因；冻结期拒绝一切新占额，既有操作不受影响且释放额度不成交候补；恢复时先按原受理顺序清理仍有效候补再放行新请求）。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），以及额度不足时的**通道候补队列**（候补可设 **1～1440 分钟申请有效期**，按受理顺序成交/失败/取消/**到期失效**，新直接申请不抢候补额度）；支持发行团队**按地区 + 渠道临时冻结 / 恢复新额度发放**（冻结须填原因；冻结期拒绝一切新占额，既有操作不受影响且释放额度不成交候补；恢复时先按原受理顺序清理仍有效候补再放行新请求）；并支持运营在**同一素材/地区/渠道的两条授权间转拨未占用次数**（操作号幂等：同号同参重放返回首次结果、异参冲突；先结算到期预留并按原顺序处理候补上再判定可转出量，成功后同事务重算候补）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
-- 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放、候补不重复成交**
+- 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放、候补不重复成交、转拨不重复执行**
 - 一键启动：`docker compose up`，自动等待数据库就绪并初始化表结构（旧库启动时幂等补齐预留字段与候补表，无需手工迁移）
 
 ---
@@ -55,8 +55,9 @@ docker compose down -v       # 停止并删除数据库数据卷（清空全部�
 
 数据库表在应用启动事件中通过 `Base.metadata.create_all` 幂等创建，**无需手工执行迁移**。
 预留功能新增的 `authorizations.reserved_count` 列与 `ck_auth_reserved_invariant`
-约束、候补功能新增的 `waitlists` / `waitlist_items` 表，以及通道冻结功能
-新增的 `channel_freezes` 表（每通道唯一行），也会在启动时
+约束、候补功能新增的 `waitlists` / `waitlist_items` 表、通道冻结功能
+新增的 `channel_freezes` 表（每通道唯一行），以及额度转拨功能新增的
+`quota_transfers` 表（操作号全局唯一），也会在启动时
 对旧版本库**幂等补齐**（列/约束/表已存在则跳过）。
 
 ### 不用 Docker 的本地运行方式
@@ -81,6 +82,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/authorizations/{id}` | 查询授权（含已用/剩余/预留次数） |
 | `PATCH` | `/authorizations/{id}` | 启用/停用授权（仅影响新申请与新预留） |
 | `POST` | `/authorizations/migrate` | **授权退役：原授权未撤销申请一次性改挂到替代授权** |
+| `POST` | `/authorizations/transfer` | **授权间额度转拨：同一素材/地区/渠道下源授权未占用次数转拨到目标授权（操作号幂等）** |
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
@@ -166,6 +168,54 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    **整体拒绝**（`pending_reservations`，不改动任何归属、次数、状态）；
    待这些预留确认/取消/到期后再改挂即可。替代授权承接迁入占用时，
    其容量还要扣除自身未到期预留（`used + reserved + n <= max`）。
+
+### 授权间额度转拨规则
+
+运营需要在**同一素材、地区、渠道**的两条不同授权间调拨未占用的发行
+次数时，用 `POST /authorizations/transfer`，请求体携带
+**源授权编号、目标授权编号、正整数转拨次数与操作号**：
+
+```json
+{
+  "source_authorization_id": 1,
+  "target_authorization_id": 2,
+  "count": 3,
+  "operation_no": "OP-20261006-0001"
+}
+```
+
+1. **受理条件**：两端授权**均启用（`active`）**且**通道未冻结**
+   （冻结期间一律 422 `channel_frozen`，不重算、不改额）；
+   两端**授权时段可以不同**；**既有申请与预留的归属不变**，转拨仅
+   原子调整两端 `max_count`（源 `-count`、目标 `+count`），
+   `used_count` / `reserved_count` 不因转拨本身变化。
+2. **先结算再判定**：受理后先在通道咨询锁内**结算本通道到期预留**
+   （归还 `reserved_count`）并**按原受理顺序处理候补**，再以源授权
+   **`max_count - used_count - reserved_count`** 判定可转出量。
+3. **整笔拒绝**（422 `quota_transfer_rejected`，两端额度均不变）：
+   可转出量**不足**（`insufficient_quota`）、**转出后源额度非正**
+   （`source_quota_not_positive`，要求 `max_count - count >= 1`）、
+   源目标编号相同（`same_authorization`）、素材/地区/渠道**维度不符**
+   （`dimension_mismatch`）、任一端未启用（`authorization_inactive`）；
+   授权编号不存在返回 404 `not_found`。
+4. **成功后同事务重算候补**：目标新增余量**优先供仍有效的队首**，
+   过期或失配（授权不再匹配）的候补依既有规则出队
+   （`expired` / `failed`）；快照在重算之后落库，故响应中的占用数
+   可能已包含被新增余量成交的候补。
+5. **响应**：操作号、转拨次数、首次转拨完成时刻，以及**两端转拨后的
+   额度与占用快照**（`max_count` / `used_count` / `reserved_count`
+   及派生余量 `remaining` / `reservable_remaining`）。
+6. **操作号幂等**：`operation_no` 全局唯一。**相同操作号 + 相同参数**
+   的重复请求**返回首次转拨结果**（200，快照原样返回，不重复转拨），
+   且**重放不受随后的通道冻结或授权停用影响**；**相同操作号 + 不同
+   参数**（源/目标/次数任一不同）返回 **409 `quota_transfer_conflict`**。
+   仅成功转拨会落库操作号；被拒绝的请求不占用操作号，修正参数后可
+   用同一操作号重新发起。
+7. **并发安全**：转拨与本通道全部发行类写事务共用同一把通道咨询锁，
+   两端授权按 id 升序行锁，额度搬移使用条件更新
+   （`max - used - reserved >= count` 且 `max - count >= 1`）并断言
+   影响行数；并发转拨**绝不超额**，并发同操作号**绝不重复转拨**
+   （唯一约束兜底，跨通道同号亦然）。
 
 ### 额度预留规则
 
@@ -389,8 +439,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `waitlist_already_expired` | 对已超过申请有效期失效（`expired`）的候补执行取消 |
 | 422 | `invalid_waitlist_status` | 候补列表使用了不支持的状态过滤值 |
 | 422 | `channel_not_found` | 冻结/恢复/查询的通道下不存在任何授权（region+channel 无授权） |
-| 422 | `channel_frozen` | 通道冻结期间提交新的直接发行 / 额度预留 / 候补受理；明确拒绝、不占额、不入队，`details` 携带冻结原因 |
-| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在） |
+| 422 | `channel_frozen` | 通道冻结期间提交新的直接发行 / 额度预留 / 候补受理 / 额度转拨；明确拒绝、不占额、不入队，`details` 携带冻结原因 |
+| 422 | `quota_transfer_rejected` | 额度转拨核验未通过；`details` 列明原因（见下），两端额度均不变 |
+| 409 | `quota_transfer_conflict` | 相同操作号携带不同参数（源/目标/次数任一不同）的转拨请求 |
+| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在；转拨时源/目标授权任一不存在） |
 
 `distribution_rejected` / `reschedule_rejected` / `reservation_rejected`
 / `waitlist_rejected` 的逐项原因 `reason`：
@@ -413,6 +465,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `period_not_covered`：替代授权时段未覆盖某些申请的发行时刻
 - `insufficient_quota`：替代授权余量（扣除其未到期预留）不足以一次性承接全部迁入占用
 - `pending_reservations`：原授权存在未到期的待确认预留，改挂整体拒绝
+
+`quota_transfer_rejected` 的原因 `reason`（`details` 中附带两端授权编号）：
+
+- `same_authorization`：源授权与目标授权编号相同
+- `dimension_mismatch`：两端素材、地区或渠道不一致
+- `authorization_inactive`：源或目标授权未处于启用状态
+- `insufficient_quota`：源授权可转出量（`max_count - used_count - reserved_count`）不足
+- `source_quota_not_positive`：转出后源授权额度将非正（要求 `max_count - count >= 1`）
 
 ---
 
@@ -711,6 +771,84 @@ curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
 # 其他通道（如 CN/app、US/web）不受 CN/web 冻结影响，照常受理与成交。
 ```
 
+### 授权间额度转拨操作示例（curl）
+
+```bash
+# 29) 前提：授权 1 与授权 2 同素材、同地区、同渠道（时段可以不同），
+#     均处于启用状态且通道未冻结。
+#     把授权 1 的 3 次未占用额度转拨到授权 2（操作号全局唯一）
+curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_authorization_id": 1,
+    "target_authorization_id": 2,
+    "count": 3,
+    "operation_no": "OP-20261006-0001"
+  }'
+# 200：{
+#   "operation_no": "OP-20261006-0001",
+#   "count": 3,
+#   "created_at": "2026-10-06T05:00:00Z",
+#   "source_authorization": {"authorization_id": 1, "max_count": 7,
+#     "used_count": 2, "reserved_count": 1,
+#     "remaining": 5, "reservable_remaining": 4},
+#   "target_authorization": {"authorization_id": 2, "max_count": 8,
+#     "used_count": 0, "reserved_count": 0,
+#     "remaining": 8, "reservable_remaining": 8}
+# }
+# 说明：仅两端 max_count 原子调整（源 -3、目标 +3）；既有申请与预留的
+#       归属不变（used_count/reserved_count 不因转拨本身变化）。
+
+# 30) 幂等重放：相同操作号 + 相同参数 -> 返回首次转拨结果（不重复转拨），
+#     即使随后通道被冻结、授权被停用，重放仍返回首次结果
+curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_authorization_id": 1,
+    "target_authorization_id": 2,
+    "count": 3,
+    "operation_no": "OP-20261006-0001"
+  }'
+# 200：响应与 29) 完全一致
+
+# 31) 相同操作号 + 不同参数（源/目标/次数任一不同）-> 409 冲突
+curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_authorization_id": 1,
+    "target_authorization_id": 2,
+    "count": 5,
+    "operation_no": "OP-20261006-0001"
+  }'
+# 409 quota_transfer_conflict
+
+# 32) 整笔拒绝（两端额度均不变）：
+#   可转出量不足（max-used-reserved < count）-> 422 insufficient_quota
+#   转出后源额度非正（max-count < 1）        -> 422 source_quota_not_positive
+#   源目标编号相同                           -> 422 same_authorization
+#   素材/地区/渠道不一致                     -> 422 dimension_mismatch
+#   任一端未启用                             -> 422 authorization_inactive
+#   通道冻结中                               -> 422 channel_frozen
+#   授权编号不存在                           -> 404 not_found
+#   次数非正整数 / 操作号缺失或为空           -> 422 请求体校验错误
+curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_authorization_id": 1,
+    "target_authorization_id": 2,
+    "count": 99,
+    "operation_no": "OP-20261006-0002"
+  }'
+# 422 quota_transfer_rejected：
+# {"error": {"code": "quota_transfer_rejected",
+#   "message": "额度转拨核验未通过，两端授权额度均未变更",
+#   "details": [{"reason": "insufficient_quota",
+#     "message": "源授权（id=1）可转出量不足：请求 99 次，可转出 4 次
+#                 （max_count 7 - used_count 2 - reserved_count 1）",
+#     "source_authorization_id": 1, "target_authorization_id": 2}]}}
+# 被拒绝的请求不占用操作号：修正参数后可用同一操作号重新发起。
+```
+
 候补成交响应示例（注意 `distribution_id`、内嵌的完整申请，
 以及申请有效期 `ttl_minutes` / `expires_at`）：
 
@@ -856,23 +994,24 @@ curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
         → 到期预留惰性结算（reservations / authorizations）
         → 候补有效期失效结算（expires_at <= now 的 pending → expired）
         → 候补队列处理（waitlists，受理顺序逐队首；冻结通道仅失效不成交）
-        → 冻结/恢复行 / 预留/申请/候补行锁（id 升序）
+        → 冻结/恢复行 / 预留/申请/候补/转拨行锁（id 升序）
         → 授权行锁（authorizations，id 升序）
         → 明细行锁（distribution/reservation/waitlist_items，id 升序）
 ```
 
 1. **通道咨询锁 `pg_advisory_xact_lock`**：按 `region+channel` 分桶，
    同一通道内的提交、预留、确认、取消、撤销、改期、改挂、候补受理与
-   候补成交，以及**通道冻结 / 恢复**由此串行判定，消除「各自读到有
-   余量、先后扣减导致超额」以及「确认/取消/改期/改挂/成交交错读到
-   一半旧状态」的竞态；事务提交/回滚时自动释放（同事务内重入同把锁
-   安全）。授权行只会被同通道事务竞争（匹配维度即 region+channel，
-   改挂也要求两端通道一致），因此不同通道不争用同一授权行，跨桶不可
-   能成等待环。冻结 / 恢复是**通道级状态翻转**（`channel_freezes`
-   每通道唯一行），在同一把锁内完成：冻结事务一旦提交，随后取得该锁
-   的新发行/新预留/候补受理全部在业务判定前读到 `frozen` 而拒绝；
-   恢复事务在同一事务/同一把锁内先结算到期、再按原受理顺序处理候补，
-   **提交后才放行新请求**，故恢复释放的额度必然先归仍有效的候补。
+   候补成交、**额度转拨**，以及**通道冻结 / 恢复**由此串行判定，消除
+   「各自读到有余量、先后扣减导致超额」以及「确认/取消/改期/改挂/
+   成交/转拨交错读到一半旧状态」的竞态；事务提交/回滚时自动释放
+   （同事务内重入同把锁安全）。授权行只会被同通道事务竞争（匹配维度
+   即 region+channel，改挂与转拨也要求两端通道一致），因此不同通道
+   不争用同一授权行，跨桶不可能成等待环。冻结 / 恢复是**通道级状态
+   翻转**（`channel_freezes` 每通道唯一行），在同一把锁内完成：冻结
+   事务一旦提交，随后取得该锁的新发行/新预留/候补受理/转拨全部在
+   业务判定前读到 `frozen` 而拒绝；恢复事务在同一事务/同一把锁内先
+   结算到期、再按原受理顺序处理候补，**提交后才放行新请求**，故恢复
+   释放的额度必然先归仍有效的候补。
 2. **到期惰性结算**：拿到通道咨询锁后、业务判定之前，事务先把本通道
    `expires_at <= now` 的待确认预留 `FOR UPDATE` 锁定，再把这些预留
    涉及的授权与业务候选授权合并、按 id 升序一次性行锁，随后条件归还
@@ -902,16 +1041,23 @@ curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
    `used+reserved < max`）、取消/到期释放 `reserved >= n`、
    改挂迁入 `used+reserved <= max-n` / 迁出 `used >= n`、
    撤销释放 `used >= 1`、改期搬移「原授权 `used >= 1` 再新授权
-   `used+reserved < max`」、候补成交占额 `used+reserved < max`，
+   `used+reserved < max`」、候补成交占额 `used+reserved < max`、
+   转拨源端 `max-used-reserved >= count` 且 `max-count >= 1`，
    全部断言影响行数，作为超额/重复释放的最后防线。
+6. **转拨幂等**：`quota_transfers.operation_no` 全局唯一。受理前
+   （无锁）与通道锁内各做一次同号预检，同号同参直接返回首次落库的
+   快照（重放不受随后的冻结/停用影响），同号异参 409；并发同号在
+   通道锁内串行化，跨通道同号由唯一约束兜底（失败方回滚后按既有
+   记录重放/判冲突），绝不重复转拨。
 
 核验/预留/改期/改挂不通过即 `ROLLBACK`，不产生任何次数或归属变化。任意时刻
 都有不变量：
 
 - `used_count` 恒等于归属该授权且处于 `approved` 状态的占用明细数；
 - `reserved_count` 恒等于归属该授权且未到期待确认的预留明细数；
-- `0 <= used_count`、`0 <= reserved_count`、
-  `used_count + reserved_count <= max_count`。
+- `1 <= max_count`、`0 <= used_count`、`0 <= reserved_count`、
+  `used_count + reserved_count <= max_count`（转拨只调整 `max_count`
+  且源端保留至少 1 次，不破坏上述不变量）。
 
 ---
 
@@ -965,6 +1111,14 @@ curl -s -X PUT http://localhost:8000/api/v1/channel-freezes \
   冻结不延长预留/候补有效期（到期即 expired 且不成交、逾期操作 409）、
   恢复时按原受理顺序成交/失效释放/失败继续/队首不足停止、恢复与新申请
   并发时候补严格优先且绝不超额、冻结与发行并发串行、其他通道不受影响。
+- `tests/test_transfer.py`：73 项授权间额度转拨端到端与并发用例，覆盖
+  字段校验（正整数次数/操作号）、时段不同可转拨、快照与查询一致、
+  既有申请与预留归属不变、可转出量边界（max-used-reserved）、不足/
+  源额度非正/源目标相同/维度不符/未启用/冻结整笔拒绝且额度不变、
+  到期预留先结算再判定、候补先按原顺序处理再判定、转拨后同事务重算
+  候补（新增余量供队首、过期/失配出队）、幂等重放返回首次结果、
+  异参 409、重放不受随后冻结/停用影响、并发不超额、并发同号同参
+  不重复转拨、并发同号异参恰一笔生效，以及全量账实相符。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -978,6 +1132,7 @@ python3 -m tests.test_concurrency
 python3 -m tests.test_reservations
 python3 -m tests.test_waitlist
 python3 -m tests.test_channel_freeze
+python3 -m tests.test_transfer
 ```
 
 > 测试会先 `DROP` 再重建全部表，请勿指向含生产数据的数据库。
@@ -996,12 +1151,13 @@ python3 -m tests.test_channel_freeze
 │   ├── config.py      # 环境变量配置（含预留 TTL 1～30 范围）
 │   ├── database.py    # 引擎/会话/启动建表（旧库幂等补齐 reserved_count 与候补表）
 │   ├── models.py      # Material / Authorization / Distribution(+Item) /
-│   │                  # Reservation(+Item) / Waitlist(+Item) / ChannelFreeze
-│   ├── schemas.py     # 请求响应模型与时段/时区/TTL/冻结原因校验
-│   ├── errors.py      # 业务错误码（预留四态、候补状态与通道冻结 channel_frozen/channel_not_found）
+│   │                  # Reservation(+Item) / Waitlist(+Item) / ChannelFreeze / QuotaTransfer
+│   ├── schemas.py     # 请求响应模型与时段/时区/TTL/冻结原因/转拨参数校验
+│   ├── errors.py      # 业务错误码（预留四态、候补状态、通道冻结 channel_frozen/channel_not_found、
+│   │                  # 转拨 quota_transfer_rejected/quota_transfer_conflict）
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
 │                      # 撤销 / 改期 / 改挂 / 候补受理与队列成交 /
-│                      # 通道冻结恢复（核心事务逻辑）
+│                      # 通道冻结恢复 / 授权间额度转拨（核心事务逻辑）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
@@ -1010,5 +1166,6 @@ python3 -m tests.test_channel_freeze
     ├── test_reservations.py
     ├── test_waitlist.py
     ├── test_channel_freeze.py
+    ├── test_transfer.py
     └── test_concurrency.py
 ```
